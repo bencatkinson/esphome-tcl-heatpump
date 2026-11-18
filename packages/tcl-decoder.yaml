@@ -1,0 +1,452 @@
+# TCL heat pump serial decoder for ESPHome
+# https://github.com/Bencatkinson/esphome-tcl-heatpump
+#
+# Sits alongside the tclac climate package (sorz2122/tclac, I-am-nightingale/tclac).
+# tclac keeps control of the unit; this package only listens to the frames the unit
+# already sends, plus one energy query (command 0x0A) after a status reply.
+#
+# Include it in your device config under packages: (see README.md):
+#
+#   packages:
+#     remote_package: ...tclac core.yaml...
+#     tcl_decoder:
+#       url: https://github.com/Bencatkinson/esphome-tcl-heatpump
+#       ref: main
+#       files: [packages/tcl-decoder.yaml]
+#
+# Byte numbers below are FRAME offsets (frame[0] = 0xBB). Sources: kralonur/
+# tcl-ac-original-module-esphome (stock module firmware, TAC-12CHSD), adaasch/AC-hack,
+# E-t0m/esphome-local-ac-control (buffered parser and energy query, MIT).
+# See docs/byte-map.md for the full map and confidence of each field.
+#
+# Entity names are a stable contract: the Home Assistant integration in this
+# project looks them up. Don't rename them without updating docs/entities.md.
+
+substitutions:
+  # Seconds between energy (0x0A) queries. 0 disables the query.
+  tcl_energy_interval_s: "30"
+  # Energy query frame. The default is the one the stock TCL Wi-Fi module sends
+  # (kralonur, TAC-12CHSD). E-t0m's 9k unit uses 0xBB,0x00,0x01,0x0A,0x03,0x05,0x00,0x00,0xB6.
+  tcl_energy_query: "0xBB, 0x00, 0x01, 0x0A, 0x03, 0x02, 0x00, 0x05, 0xB4"
+  # Supply voltage byte wraps past 255 V. Raw values below this get 256 added.
+  tcl_voltage_wrap_below: "120"
+
+globals:
+  - id: tcl_rx_buf
+    type: std::vector<uint8_t>
+  - id: tcl_last_status_ms
+    type: uint32_t
+    initial_value: "0"
+  - id: tcl_energy_last_query_ms
+    type: uint32_t
+    initial_value: "0"
+  # Last energy counter step, for power derived from counter changes.
+  - id: tcl_energy_prev_kwh
+    type: double
+    initial_value: "NAN"
+  - id: tcl_energy_prev_ms
+    type: uint32_t
+    initial_value: "0"
+  - id: tcl_energy_step_kwh
+    type: double
+    initial_value: "0.0"
+  - id: tcl_energy_rate_w
+    type: float
+    initial_value: "NAN"
+  - id: tcl_compressor_hz
+    type: int
+    initial_value: "-1"
+
+script:
+  # The unit only answers 0x0A if it arrives shortly (~180 ms) after a status reply.
+  - id: tcl_energy_request
+    mode: single
+    then:
+      - delay: 180ms
+      - uart.write:
+          id: tcl_uart
+          data: !lambda |-
+            return std::vector<uint8_t>{${tcl_energy_query}};
+
+uart:
+  # Merges into the uart: block of tclac's core.yaml (one UART, now with an id).
+  id: tcl_uart
+  debug:
+    direction: RX
+    dummy_receiver: false
+    after:
+      timeout: 50ms
+    sequence:
+      - lambda: |-
+          auto &buf = id(tcl_rx_buf);
+          buf.insert(buf.end(), bytes.begin(), bytes.end());
+          if (buf.size() > 512) buf.clear();
+
+          // Publish only on change, to keep Wi-Fi and HA recorder traffic low.
+          auto pub = [](sensor::Sensor *s, float v) {
+            if (std::isnan(v)) {
+              if (!std::isnan(s->state)) s->publish_state(NAN);
+              return;
+            }
+            if (std::isnan(s->state) || s->state != v) s->publish_state(v);
+          };
+          auto pub_bin = [](binary_sensor::BinarySensor *s, bool v) {
+            if (!s->has_state() || s->state != v) s->publish_state(v);
+          };
+          auto pub_text = [](text_sensor::TextSensor *s, const std::string &v) {
+            if (!s->has_state() || s->state != v) s->publish_state(v);
+          };
+          auto bit = [](uint8_t b, int n) { return ((b >> n) & 1) != 0; };
+          auto bcd_ok = [](uint8_t b) { return (b & 0x0F) <= 9 && (b >> 4) <= 9; };
+          auto bcd = [](uint8_t b) { return (b >> 4) * 10 + (b & 0x0F); };
+
+          while (true) {
+            // Resynchronise on 0xBB, then check length and XOR checksum.
+            size_t start = 0;
+            while (start < buf.size() && buf[start] != 0xBB) start++;
+            if (start > 0) buf.erase(buf.begin(), buf.begin() + start);
+            if (buf.size() < 5) break;
+            const size_t total = (size_t) buf[4] + 6;
+            if (total < 8 || total > 128) { buf.erase(buf.begin()); continue; }
+            if (buf.size() < total) break;
+            uint8_t cs = 0;
+            for (size_t i = 0; i + 1 < total; i++) cs ^= buf[i];
+            if (cs != buf[total - 1]) { buf.erase(buf.begin()); continue; }
+            std::vector<uint8_t> f(buf.begin(), buf.begin() + total);
+            buf.erase(buf.begin(), buf.begin() + total);
+            // Only frames from the unit to the module.
+            if (f[1] != 0x01 || f[2] != 0x00) continue;
+            const uint8_t cmd = f[3];
+
+            if ((cmd == 0x03 || cmd == 0x04) && total >= 61) {
+              id(tcl_last_status_ms) = millis();
+              if (id(tcl_last_status_ms) == 0) id(tcl_last_status_ms) = 1;
+
+              // --- Settings echoed by the unit ---
+              const bool power = bit(f[7], 4);
+              pub(id(hp_target_temperature_exact), (f[8] & 0x0F) + 16 + (bit(f[9], 1) ? 0.5f : 0.0f));
+              pub_bin(id(hp_frost_protect), bit(f[32], 7));
+              pub_bin(id(hp_silent_mode), bit(f[33], 7));
+
+              // --- Room temperature from the unit's return-air sensor, 0.1 °C ---
+              const int room_raw = ((int) f[17] << 2) | ((f[18] >> 2) & 3);
+              pub(id(hp_room_temp), (room_raw - 200) / 10.0f);
+
+              // --- Byte 30: two readings multiplexed by frame 18 bit 5 ---
+              const float t30 = f[30] * 0.4f - 20.0f;
+              if (bit(f[18], 5)) pub(id(hp_byte30_b), t30);
+              else pub(id(hp_byte30_a), t30);
+
+              // --- Hardware telemetry (labels inferred; see docs/byte-map.md) ---
+              pub(id(hp_indoor_fan), f[34]);
+              pub(id(hp_outdoor_temp), (int) f[35] - 20);
+              pub(id(hp_outdoor_coil_temp), (int) f[36] - 20);
+              pub(id(hp_discharge_temp), (int) f[37] - 20);
+              const int hz = f[38];
+              id(tcl_compressor_hz) = hz;
+              pub(id(hp_compressor_freq), hz);
+              pub_bin(id(hp_compressor_running), hz > 0);
+              pub(id(hp_outdoor_fan), f[39]);
+              if (f[45] == 0) pub(id(hp_supply_voltage), NAN);
+              else pub(id(hp_supply_voltage), f[45] + (f[45] < ${tcl_voltage_wrap_below} ? 256 : 0));
+              pub(id(hp_load_index), f[46]);
+
+              // --- Filter flags (frame 50) ---
+              pub_bin(id(hp_filter_blocked), bit(f[50], 1));
+              pub_bin(id(hp_filter_alarm_enabled), bit(f[50], 2));
+
+              // --- Error codes: stock TCL numbering, frame = payload + 5 ---
+              struct Src { uint8_t idx, bit, code; };
+              static const Src kErr[] = {
+                {16,0,56},{16,1,57},{16,4,54},{16,5,55},{16,6,52},{16,7,53},{16,3,1},
+                {41,0,1},{41,1,2},{41,2,3},{41,3,4},{41,4,5},{41,5,6},{41,6,7},{41,7,8},
+                {42,0,9},{42,1,10},{42,2,11},{42,3,12},{42,4,13},{42,5,14},{42,6,15},{42,7,16},
+                {43,0,17},{43,1,18},{43,2,19},{43,3,20},{43,4,21},{43,5,22},{43,6,23},{43,7,24},
+                {44,4,25},{44,6,26},{44,7,78},
+                {56,0,27},{56,1,28},{56,2,29},{56,3,30},{56,4,31},{56,5,32},{56,6,33},
+                {57,0,34},{57,1,35},{57,2,36},{57,3,37},{57,4,38},{57,5,39},{57,6,40},
+                {58,0,41},{58,1,42},{58,2,43},{58,3,44},{58,4,45},{58,5,46},{58,6,47},
+                {59,0,48},{59,1,49},{59,2,50},{59,3,51},{59,4,64},
+              };
+              std::string errs;
+              int last = -1;
+              for (const auto &e : kErr) {
+                if (e.idx + 1 >= total) continue;
+                // Bit 7 of frames 56-59 masks that byte's whole error group.
+                if (e.idx >= 56 && e.idx <= 59 && bit(f[e.idx], 7)) continue;
+                if (!bit(f[e.idx], e.bit) || e.code == last) continue;
+                if (!errs.empty()) errs += ",";
+                errs += std::to_string(e.code);
+                last = e.code;
+              }
+              pub_text(id(hp_error_codes), errs.empty() ? std::string("none") : errs);
+              pub_bin(id(hp_fault), !errs.empty());
+
+              // --- Raw frame and bytes with no known meaning, for further decoding ---
+              static const uint8_t known[] = {0,1,2,3,4,5,7,8,9,11,12,13,14,16,17,18,19,
+                                              30,32,33,34,35,36,37,38,39,41,42,43,44,45,46,
+                                              50,51,52,56,57,58,59};
+              std::string all, unknown;
+              char h[12];
+              for (size_t i = 0; i < total; i++) {
+                snprintf(h, sizeof(h), i ? " %02X" : "%02X", f[i]);
+                all += h;
+                if (i == total - 1 || f[i] == 0) continue;
+                bool is_known = false;
+                for (uint8_t k : known) if (k == i) { is_known = true; break; }
+                if (is_known) continue;
+                snprintf(h, sizeof(h), unknown.empty() ? "%u:%02X" : " %u:%02X", (unsigned) i, f[i]);
+                unknown += h;
+              }
+              pub_text(id(hp_status_frame), all);
+              pub_text(id(hp_unknown_bytes), unknown.empty() ? std::string("-") : unknown);
+
+              // Unit off and compressor stopped: outdoor unit draws (almost) nothing.
+              if (!power && hz == 0) {
+                id(tcl_energy_rate_w) = 0.0f;
+                pub(id(hp_power), 0.0f);
+              } else if (hz == 0 && !std::isnan(id(tcl_energy_rate_w))) {
+                id(tcl_energy_rate_w) = 0.0f;
+              }
+
+              // Energy query: must directly follow a status reply.
+              const uint32_t every = (uint32_t) ${tcl_energy_interval_s} * 1000UL;
+              if (every > 0 && (id(tcl_energy_last_query_ms) == 0 ||
+                                millis() - id(tcl_energy_last_query_ms) >= every)) {
+                id(tcl_energy_last_query_ms) = millis() | 1;
+                id(tcl_energy_request).execute();
+              }
+
+            } else if (cmd == 0x0A && total >= 24 && bit(f[7], 3)) {
+              // Energy reply: packed BCD kWh counter (stock module arithmetic).
+              const uint8_t idxs[] = {8, 9, 10, 11, 20, 21};
+              bool ok = true;
+              for (uint8_t i : idxs) ok &= bcd_ok(f[i]);
+              if (!ok) continue;
+              const double kwh = bcd(f[11]) * 10000.0 + bcd(f[10]) * 100.0 + bcd(f[9]) +
+                                 bcd(f[8]) / 100.0 + bcd(f[21]) / 10000.0 + bcd(f[20]) / 1000000.0;
+              pub(id(hp_energy), (float) kwh);
+              pub(id(hp_energy_raw_byte22), f[22]);
+
+              // Power from counter steps: W = dkWh * 3.6e6 / dt.
+              const uint32_t now = millis();
+              double &prev = id(tcl_energy_prev_kwh);
+              if (std::isnan(prev) || kwh < prev) {
+                prev = kwh;
+                id(tcl_energy_prev_ms) = now;
+              } else if (kwh > prev) {
+                const double dt = (now - id(tcl_energy_prev_ms)) / 1000.0;
+                const double step = kwh - prev;
+                if (dt >= 5.0 && dt <= 900.0) {
+                  id(tcl_energy_rate_w) = (float) (step * 3600000.0 / dt);
+                  id(tcl_energy_step_kwh) = step;
+                }
+                prev = kwh;
+                id(tcl_energy_prev_ms) = now;
+              }
+            }
+          }
+
+interval:
+  - interval: 10s
+    then:
+      - lambda: |-
+          // Link health: a valid status frame in the last 30 s.
+          const uint32_t last = id(tcl_last_status_ms);
+          const bool fresh = last != 0 && millis() - last < 30000;
+          if (!id(hp_link).has_state() || id(hp_link).state != fresh) id(hp_link).publish_state(fresh);
+
+          // Power estimate from the energy counter. Between steps the power can't be
+          // higher than one counter step over the time since the last step, so the
+          // estimate decays instead of holding a stale high value.
+          float w = id(tcl_energy_rate_w);
+          if (!fresh) w = NAN;
+          else if (!std::isnan(w) && w > 0 && id(tcl_energy_step_kwh) > 0) {
+            const double since = (millis() - id(tcl_energy_prev_ms)) / 1000.0;
+            const double cap = id(tcl_energy_step_kwh) * 3600000.0 / since;
+            if (since > 0 && cap < w) w = (float) cap;
+          }
+          if (!std::isnan(w)) w = roundf(w);
+          auto *s = id(hp_power);
+          if (std::isnan(w) ? !std::isnan(s->state) : (std::isnan(s->state) || s->state != w))
+            s->publish_state(w);
+
+sensor:
+  # ---- Primary measurements (used by the integration) ----
+  - platform: template
+    id: hp_room_temp
+    name: "Room temperature (unit)"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+  - platform: template
+    id: hp_target_temperature_exact
+    name: "Target temperature (unit)"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+    update_interval: never
+  - platform: template
+    id: hp_outdoor_temp
+    name: "Outdoor temperature"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: hp_compressor_freq
+    name: "Compressor frequency"
+    unit_of_measurement: "Hz"
+    device_class: frequency
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: hp_energy
+    name: "Energy"
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 3
+    update_interval: never
+  - platform: template
+    id: hp_power
+    name: "Power"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+
+  # ---- Diagnostics ----
+  - platform: template
+    id: hp_byte30_a
+    name: "Indoor coil temperature A"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: hp_byte30_b
+    name: "Indoor coil temperature B"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: hp_outdoor_coil_temp
+    name: "Outdoor coil temperature"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: hp_discharge_temp
+    name: "Compressor discharge temperature"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: hp_indoor_fan
+    name: "Indoor fan speed (raw)"
+    state_class: measurement
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: hp_outdoor_fan
+    name: "Outdoor fan speed (raw)"
+    state_class: measurement
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: hp_supply_voltage
+    name: "Supply voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: hp_load_index
+    name: "Compressor load index (raw)"
+    icon: mdi:current-ac
+    state_class: measurement
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: hp_energy_raw_byte22
+    name: "Energy reply byte 22 (raw)"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    disabled_by_default: true
+    update_interval: never
+
+binary_sensor:
+  - platform: template
+    id: hp_compressor_running
+    name: "Compressor running"
+    device_class: running
+  - platform: template
+    id: hp_link
+    name: "Heat pump link"
+    device_class: connectivity
+    entity_category: diagnostic
+  - platform: template
+    id: hp_fault
+    name: "Fault"
+    device_class: problem
+    entity_category: diagnostic
+  - platform: template
+    id: hp_filter_blocked
+    name: "Filter blocked"
+    device_class: problem
+    entity_category: diagnostic
+  - platform: template
+    id: hp_filter_alarm_enabled
+    name: "Filter alarm enabled"
+    entity_category: diagnostic
+  - platform: template
+    id: hp_frost_protect
+    name: "8 °C frost protection"
+    entity_category: diagnostic
+  - platform: template
+    id: hp_silent_mode
+    name: "Silent mode"
+    entity_category: diagnostic
+
+text_sensor:
+  - platform: template
+    id: hp_error_codes
+    name: "Error codes"
+    icon: mdi:alert-circle-outline
+    entity_category: diagnostic
+    update_interval: never
+  # Off by default: these change every frame. Enable them in HA while decoding.
+  - platform: template
+    id: hp_status_frame
+    name: "Status frame (raw)"
+    entity_category: diagnostic
+    disabled_by_default: true
+    update_interval: never
+  - platform: template
+    id: hp_unknown_bytes
+    name: "Unknown status bytes"
+    entity_category: diagnostic
+    disabled_by_default: true
+    update_interval: never

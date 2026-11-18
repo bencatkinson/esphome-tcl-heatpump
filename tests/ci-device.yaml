@@ -1,0 +1,25 @@
+# Build test: tclac + this decoder on the same hardware as the office unit.
+# Dummy credentials only. Run: esphome compile tests/ci-device.yaml
+substitutions:
+  device_name: ciheatpump
+  humanly_name: CI Heat Pump
+  wifi_ssid: ci-ssid
+  wifi_password: ci-password-123
+  recovery_pass: ci-recovery-123
+  ota_pass: ci-ota-password
+  api_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+  uart_rx: GPIO14
+  uart_tx: GPIO12
+  receive_led: GPIO6
+  transmit_led: GPIO4
+
+packages:
+  remote_package:
+    url: https://github.com/sorz2122/tclac.git
+    ref: master
+    files:
+      - packages/core.yaml
+  tcl_decoder: !include ../packages/tcl-decoder.yaml
+
+esp8266:
+  board: esp12e
