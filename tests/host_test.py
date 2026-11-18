@@ -42,6 +42,8 @@ CPP = r"""
 #include <string>
 #include <vector>
 #include <map>
+// Arduino core macros that clash with common helper names
+#define bit(b) (1UL << (b))
 static uint32_t fake_ms = 100000;
 uint32_t millis() { return fake_ms; }
 namespace sensor { struct Sensor { float state = NAN; int n = 0; void publish_state(float v) { state = v; n++; } }; }

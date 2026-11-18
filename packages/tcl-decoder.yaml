@@ -96,7 +96,7 @@ uart:
           auto pub_text = [](text_sensor::TextSensor *s, const std::string &v) {
             if (!s->has_state() || s->state != v) s->publish_state(v);
           };
-          auto bit = [](uint8_t b, int n) { return ((b >> n) & 1) != 0; };
+          auto flag = [](uint8_t b, int n) { return ((b >> n) & 1) != 0; };
           auto bcd_ok = [](uint8_t b) { return (b & 0x0F) <= 9 && (b >> 4) <= 9; };
           auto bcd = [](uint8_t b) { return (b >> 4) * 10 + (b & 0x0F); };
 
