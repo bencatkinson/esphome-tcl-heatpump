@@ -22,7 +22,9 @@ swap `office_heat_pump` for your device's slug.
 | Heat pump link | `binary_sensor.office_heat_pump_heat_pump_link` | connectivity | On while valid status frames arrive (within 30 s). Treat every other value as stale when off |
 
 The climate entity itself stays tclac's: `climate.office_heat_pump_officeheatpump_climate`
-(ESPHome id `officeheatpumpclimate`).
+(ESPHome id `officeheatpumpclimate`). With `packages/tclac-half-degree.yaml` its
+`target_temp_step` is 0.5 and it accepts .5 setpoints; without it, whole degrees only.
+Read Target temperature (unit) to see what the unit actually accepted.
 
 ## Diagnostics
 

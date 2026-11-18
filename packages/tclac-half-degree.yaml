@@ -1,0 +1,17 @@
+# 0.5 °C setpoints for tclac.
+#
+# Swaps tclac's climate component for a copy with a small patch (branch half-degree of
+# https://github.com/Bencatkinson/tclac, based on I-am-nightingale/tclac master):
+#   - sends the half-degree flag (control frame byte 11 bit 1)
+#   - reads the half-degree bit back from status byte 9 bit 1
+#   - target temperature step 0.5 °C in Home Assistant
+#
+# List this package AFTER tclac's core.yaml in packages: (the last external
+# component source for tclac wins).
+external_components:
+  - source:
+      type: git
+      url: https://github.com/Bencatkinson/tclac
+      ref: half-degree
+    components: [tclac]
+    refresh: 1d

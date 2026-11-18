@@ -49,9 +49,14 @@ yet, so compare it with a plug-in or clamp meter before trusting absolute number
 ## Setpoint resolution
 
 The unit reports and (on the TAC-12CHSD, per kralonur) accepts **0.5 °C setpoints**: the
-outgoing control frame carries a half-degree flag in **frame 11 bit 1**. tclac never sets
-it (it writes `dataTX[11] = 0` and truncates the setpoint to whole degrees), so with
-stock tclac the controller only gets 1 °C steps. Supporting 0.5 °C needs a small tclac
-change: set `dataTX[11] |= 0x02` when the requested setpoint has a .5, read the half bit
-(frame 9 bit 1) back into `target_temperature`, and set the climate's visual step to 0.5.
-Until that's tested on this unit, assume 1 °C steps.
+outgoing control frame carries a half-degree flag in **frame 11 bit 1** (Celsius; bit 2 when
+the Fahrenheit flag, frame 12 bit 7, is set). Stock tclac never sets it and truncates the
+setpoint to whole degrees.
+
+`packages/tclac-half-degree.yaml` swaps in a patched tclac (branch `half-degree` of
+Bencatkinson/tclac) that sets `dataTX[11] |= 0x02` for a .5 setpoint, reads frame 9 bit 1
+back into `target_temperature`, and sets the climate's step to 0.5 °C.
+
+To confirm on a unit: set 21.5 °C and check that **Target temperature (unit)** reads 21.5
+(and the unit's display shows .5 if it has one). If it reads 21.0, the unit ignores the
+flag and you should remove the package.

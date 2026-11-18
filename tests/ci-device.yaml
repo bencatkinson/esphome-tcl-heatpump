@@ -20,6 +20,7 @@ packages:
     files:
       - packages/core.yaml
   tcl_decoder: !include ../packages/tcl-decoder.yaml
+  tclac_half_degree: !include ../packages/tclac-half-degree.yaml
 
 esp8266:
   board: esp12e

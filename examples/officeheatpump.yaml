@@ -28,6 +28,7 @@ packages:
     ref: main
     files:
       - packages/tcl-decoder.yaml
+      - packages/tclac-half-degree.yaml   # 0.5 °C setpoints; must come after tclac
     refresh: 1d
 
 esp8266:

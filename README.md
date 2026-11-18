@@ -59,8 +59,22 @@ Override in your own `substitutions:`.
 
 ## Half-degree setpoints
 
-The unit reports a half-degree setpoint bit, and the TAC-12CHSD accepts 0.5 °C commands,
-but tclac only sends whole degrees. See [docs/byte-map.md](docs/byte-map.md#setpoint-resolution).
+Stock tclac only sends whole degrees. Add the second package, after tclac's, to get 0.5 °C
+steps:
+
+```yaml
+packages:
+  remote_package: ...            # tclac core.yaml, unchanged
+  tcl_decoder: ...               # as above
+  tclac_half_degree:
+    url: https://github.com/Bencatkinson/esphome-tcl-heatpump
+    ref: main
+    files: [packages/tclac-half-degree.yaml]
+```
+
+It replaces tclac's climate component with a patched copy (3 small changes, see
+[docs/byte-map.md](docs/byte-map.md#setpoint-resolution)). After flashing, set 21.5 °C and
+check that **Target temperature (unit)** reads 21.5.
 
 ## Known gaps
 
