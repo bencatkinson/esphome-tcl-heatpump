@@ -123,10 +123,10 @@ uart:
               if (id(tcl_last_status_ms) == 0) id(tcl_last_status_ms) = 1;
 
               // --- Settings echoed by the unit ---
-              const bool power = bit(f[7], 4);
-              pub(id(hp_target_temperature_exact), (f[8] & 0x0F) + 16 + (bit(f[9], 1) ? 0.5f : 0.0f));
-              pub_bin(id(hp_frost_protect), bit(f[32], 7));
-              pub_bin(id(hp_silent_mode), bit(f[33], 7));
+              const bool power = flag(f[7], 4);
+              pub(id(hp_target_temperature_exact), (f[8] & 0x0F) + 16 + (flag(f[9], 1) ? 0.5f : 0.0f));
+              pub_bin(id(hp_frost_protect), flag(f[32], 7));
+              pub_bin(id(hp_silent_mode), flag(f[33], 7));
 
               // --- Room temperature from the unit's return-air sensor, 0.1 °C ---
               const int room_raw = ((int) f[17] << 2) | ((f[18] >> 2) & 3);
@@ -134,7 +134,7 @@ uart:
 
               // --- Byte 30: two readings multiplexed by frame 18 bit 5 ---
               const float t30 = f[30] * 0.4f - 20.0f;
-              if (bit(f[18], 5)) pub(id(hp_byte30_b), t30);
+              if (flag(f[18], 5)) pub(id(hp_byte30_b), t30);
               else pub(id(hp_byte30_a), t30);
 
               // --- Hardware telemetry (labels inferred; see docs/byte-map.md) ---
@@ -152,8 +152,8 @@ uart:
               pub(id(hp_load_index), f[46]);
 
               // --- Filter flags (frame 50) ---
-              pub_bin(id(hp_filter_blocked), bit(f[50], 1));
-              pub_bin(id(hp_filter_alarm_enabled), bit(f[50], 2));
+              pub_bin(id(hp_filter_blocked), flag(f[50], 1));
+              pub_bin(id(hp_filter_alarm_enabled), flag(f[50], 2));
 
               // --- Error codes: stock TCL numbering, frame = payload + 5 ---
               struct Src { uint8_t idx, bit, code; };
@@ -173,8 +173,8 @@ uart:
               for (const auto &e : kErr) {
                 if (e.idx + 1 >= total) continue;
                 // Bit 7 of frames 56-59 masks that byte's whole error group.
-                if (e.idx >= 56 && e.idx <= 59 && bit(f[e.idx], 7)) continue;
-                if (!bit(f[e.idx], e.bit) || e.code == last) continue;
+                if (e.idx >= 56 && e.idx <= 59 && flag(f[e.idx], 7)) continue;
+                if (!flag(f[e.idx], e.bit) || e.code == last) continue;
                 if (!errs.empty()) errs += ",";
                 errs += std::to_string(e.code);
                 last = e.code;
@@ -217,7 +217,7 @@ uart:
                 id(tcl_energy_request).execute();
               }
 
-            } else if (cmd == 0x0A && total >= 24 && bit(f[7], 3)) {
+            } else if (cmd == 0x0A && total >= 24 && flag(f[7], 3)) {
               // Energy reply: packed BCD kWh counter (stock module arithmetic).
               const uint8_t idxs[] = {8, 9, 10, 11, 20, 21};
               bool ok = true;
